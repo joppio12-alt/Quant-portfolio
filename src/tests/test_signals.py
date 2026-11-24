@@ -4,7 +4,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import pandas as pd
 import numpy as np
-from signals import add_indicators, add_relative_strength
+from core.signals import add_indicators, add_relative_strength
 
 
 def make_synthetic_prices(closes):
