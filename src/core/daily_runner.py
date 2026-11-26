@@ -3,19 +3,17 @@ import time
 import datetime
 from pathlib import Path
 
-import yfinance as yf
-
 from core.signals import add_indicators, add_relative_strength
 from core.risk import add_position_size
 from core.portfolio import (
     load_portfolio, position_count, sector_counts, total_invested,
     held_tickers, add_position, remove_position, save_portfolio,
 )
+from core.price_cache import get_price_history, get_benchmark_history
 from profiles.profile_1_trend_momentum import add_entry_signal, check_exit, trading_days_held
 
-CHUNK_SIZE = 100
-LOOKBACK = "6mo"
-BENCHMARK_LOOKBACK = "2y"
+PRICE_LOOKBACK_DAYS = 185       # equivalent to the old LOOKBACK = "6mo"
+BENCHMARK_LOOKBACK_DAYS = 730   # equivalent to the old BENCHMARK_LOOKBACK = "2y"
 REGIME_SMA_WINDOW = 200
 MAX_POSITIONS = 10
 CASH_RESERVE_PCT = 0.10
@@ -34,44 +32,6 @@ def load_latest_universe() -> dict:
     files = sorted(DATA_DIR.glob("universe_*.json"))
     with open(files[-1]) as f:
         return json.load(f)
-
-
-def chunked(lst, size):
-    for i in range(0, len(lst), size):
-        yield lst[i:i + size]
-
-
-def batch_download(tickers: list) -> dict:
-    data = {}
-    for group in chunked(tickers, CHUNK_SIZE):
-        raw = yf.download(
-            tickers=group,
-            period=LOOKBACK,
-            group_by="ticker",
-            threads=True,
-            auto_adjust=True,
-            progress=False,
-        )
-        for ticker in group:
-            try:
-                df = raw[ticker].dropna(how="all")
-                if not df.empty:
-                    data[ticker] = df
-            except KeyError:
-                continue
-    return data
-
-
-def download_benchmarks() -> dict:
-    raw = yf.download(
-        tickers=list(BENCHMARKS.values()),
-        period=BENCHMARK_LOOKBACK,
-        group_by="ticker",
-        threads=True,
-        auto_adjust=True,
-        progress=False,
-    )
-    return {track: raw[ticker].dropna(how="all") for track, ticker in BENCHMARKS.items()}
 
 
 def market_regime_ok(benchmark_df, window: int = REGIME_SMA_WINDOW) -> bool:
@@ -197,19 +157,20 @@ def score_candidates(candidates: list) -> tuple:
     return ranked, (adx_mean, adx_std, rs_mean, rs_std)
 
 
-def select_shortlist(ranked_candidates: list, portfolio_state: dict, portfolio_value: float) -> tuple:
+def select_shortlist(ranked_candidates: list, portfolio_state: dict, portfolio_value: float,
+                      max_positions: int = MAX_POSITIONS, cash_reserve_pct: float = CASH_RESERVE_PCT) -> tuple:
     already_held = held_tickers(portfolio_state)
     running_count = position_count(portfolio_state)
     running_sector_counts = dict(sector_counts(portfolio_state))
     running_cash = portfolio_state["cash"]
-    min_cash_reserve = CASH_RESERVE_PCT * portfolio_value
+    min_cash_reserve = cash_reserve_pct * portfolio_value
 
     shortlist = []
     blocked = []
     for c in ranked_candidates:
         if c["ticker"] in already_held:
             continue
-        if running_count >= MAX_POSITIONS:
+        if running_count >= max_positions:
             blocked.append(c)
             continue
         if running_cash - c["cost"] < min_cash_reserve:
@@ -313,6 +274,18 @@ def confirm_and_execute_rotation(rotation: dict, portfolio_state: dict, scenario
     print("Confirm this swap? (y/n):")
     choice = input("> ").strip().lower()
     if choice == "y":
+        # Affordability check -- without this, a rotation buy could be sized
+        # against stale/mark-to-market portfolio value that cash on hand
+        # doesn't actually support, driving cash negative. Only proceed if
+        # the buy is covered by what the sell actually frees up.
+        sell_proceeds = rotation["sell_price"] * sell["shares"]
+        cash_after_sell = portfolio_state["cash"] + sell_proceeds
+        if buy["cost"] > cash_after_sell:
+            print(f"Rotation aborted: buying {buy['ticker']} would cost {buy['cost']:.2f} "
+                  f"but only {cash_after_sell:.2f} would be available after selling "
+                  f"{sell['ticker']}. Skipping -- no partial swap, no cash overdraft.")
+            return portfolio_state
+
         portfolio_state = remove_position(portfolio_state, sell["ticker"], rotation["sell_price"])
         today_str = datetime.date.today().isoformat()
         portfolio_state = add_position(
@@ -345,10 +318,11 @@ if __name__ == "__main__":
           f"invested={total_invested(portfolio_state):.2f}, open positions={position_count(portfolio_state)}")
 
     start = time.time()
-    print(f"\nDownloading price history for {len(download_list)} tickers in batches of {CHUNK_SIZE}...")
-    price_data = batch_download(download_list)
-    benchmarks = download_benchmarks()
-    print(f"Downloaded {len(price_data)} tickers + 2 benchmarks in {time.time() - start:.1f}s")
+    print(f"\nFetching price history for {len(download_list)} tickers "
+          f"(cache serves what's already stored, Yahoo only fills the gap)...")
+    price_data = get_price_history(download_list, min_lookback_days=PRICE_LOOKBACK_DAYS)
+    benchmarks = get_benchmark_history(BENCHMARKS, min_lookback_days=BENCHMARK_LOOKBACK_DAYS)
+    print(f"Ready: {len(price_data)} tickers + {len(benchmarks)} benchmarks in {time.time() - start:.1f}s")
 
     if portfolio_state["positions"]:
         print("\nChecking open positions for exit conditions...")

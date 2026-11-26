@@ -22,8 +22,12 @@ from core.risk import add_position_size
 PROFILE_1_CONFIG = {
     "trend_lookback": 10,
     "rsi_threshold": 50,
-    "atr_stop_multiplier": 2.0,
-    "time_stop_trading_days": 30,  # ~6 weeks -- starting assumption, pending backtest validation
+    "atr_stop_multiplier": 2.0,            # entry stop distance -- drives position sizing, don't change for this experiment
+    "trailing_stop_atr_multiplier": 2.0,   # trailing-stop distance -- independent of entry sizing (tested wider, reverted: real CAGR/Sharpe gain but meaningfully worse max drawdown)
+    "min_holding_days_for_trailing_stop": 0,  # NEW -- trailing stop can't fire until a position has been held this many trading days; 0 = no-op, matches prior behavior
+    "time_stop_trading_days": 30,
+    "trend_break_buffer_pct": 0.0,  # NEW -- requires price to close this % below sma50, not just any touch; 0.0 = no-op, matches prior behavior  # ~6 weeks -- starting assumption, pending backtest validation
+    "min_entry_cushion_pct": 0.0,  # NEW -- requires price to be at least this % above sma50 at entry; 0.0 = no-op, matches prior behavior
 }
 
 
@@ -38,49 +42,46 @@ def add_entry_signal(df: pd.DataFrame, config: dict = PROFILE_1_CONFIG) -> pd.Da
     macd_cross_up = (df["macd"] > df["macd_signal"]) & (df["macd"].shift(1) <= df["macd_signal"].shift(1))
     momentum_trigger = rsi_cross_up | macd_cross_up
 
-    df["entry_signal"] = trend_ok & momentum_trigger
+    cushion_pct = (df["Close"] - df["sma50"]) / df["sma50"]
+    cushion_ok = cushion_pct >= config.get("min_entry_cushion_pct", 0.0)
+    df["entry_signal"] = trend_ok & momentum_trigger & cushion_ok
     df["stop_price"] = df["Close"] - config["atr_stop_multiplier"] * df["atr14"]
 
     return df
 
 
-def trading_days_held(entry_date: str) -> int:
+def trading_days_held(entry_date: str, as_of_date: datetime.date = None) -> int:
     entry = datetime.date.fromisoformat(entry_date)
-    calendar_days = (datetime.date.today() - entry).days
+    reference = as_of_date or datetime.date.today()
+    calendar_days = (reference - entry).days
     return int(calendar_days * 5 / 7)  # rough trading-day approximation, ignores holidays
 
 
-def check_exit(position: dict, today_row, config: dict = PROFILE_1_CONFIG) -> dict:
-    """
-    Checks one open position against today's price data.
-    today_row: latest row from add_indicators() output for this ticker
-    (needs Close, sma50, atr14).
-
-    Exit priority: trailing stop first (hard protective floor), then
-    trend break (the thesis itself has failed), then time-stop (a
-    stagnant position that's neither working nor stopped out).
-    """
+def check_exit(position: dict, today_row, config: dict = PROFILE_1_CONFIG, as_of_date: datetime.date = None) -> dict:
     close = today_row["Close"]
     sma50 = today_row["sma50"]
 
     highest_close = max(position.get("highest_close", position["entry_price"]), close)
     atr_at_entry = position.get("atr_at_entry", today_row["atr14"])
-    trailing_stop = highest_close - config["atr_stop_multiplier"] * atr_at_entry
+    trailing_multiplier = config.get("trailing_stop_atr_multiplier", config["atr_stop_multiplier"])
+    trailing_stop = highest_close - trailing_multiplier * atr_at_entry
 
-    if close <= trailing_stop:
+    days_held = trading_days_held(position["entry_date"], as_of_date)
+    min_days_for_trailing = config.get("min_holding_days_for_trailing_stop", 0)
+
+    if days_held >= min_days_for_trailing and close <= trailing_stop:
         return {"exit": True, "reason": "trailing_stop", "exit_price": close, "highest_close": highest_close}
 
-    if close < sma50:
+    trend_break_buffer = config.get("trend_break_buffer_pct", 0.0)
+    if close < sma50 * (1 - trend_break_buffer):
         return {"exit": True, "reason": "trend_break", "exit_price": close, "highest_close": highest_close}
 
-    days_held = trading_days_held(position["entry_date"])
     if days_held >= config["time_stop_trading_days"]:
         unrealized_pnl = (close - position["entry_price"]) * position["shares"]
         if unrealized_pnl <= 0:
             return {"exit": True, "reason": "time_stop", "exit_price": close, "highest_close": highest_close}
 
     return {"exit": False, "reason": None, "exit_price": None, "highest_close": highest_close}
-
 
 if __name__ == "__main__":
     ticker = "ASML.AS"
